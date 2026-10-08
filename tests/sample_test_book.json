@@ -1,0 +1,110 @@
+{
+  "book": "Agent Exchange — sample book (spec, probe, manifest, poll, reply, honesty rules)",
+  "base": "http://localhost:8090",
+  "cases": [
+    {
+      "name": "the server is up",
+      "request": {"method": "GET", "path": "/healthz"},
+      "expect": {"status": 200, "json": [{"path": "ok", "op": "eq", "value": true}]}
+    },
+    {
+      "name": "the spec is served and names the catalog",
+      "request": {"method": "GET", "path": "/api/exchange/spec"},
+      "expect": {"status": 200, "json": [
+        {"path": "name", "op": "contains", "value": "Agent Exchange"},
+        {"path": "catalog.services", "op": "exists"},
+        {"path": "partner_services.offerings", "op": "exists"}
+      ]}
+    },
+    {
+      "name": "O1 — the spec does NOT promise a human classifies a mandate-less declaration",
+      "request": {"method": "GET", "path": "/api/exchange/spec"},
+      "expect": {"status": 200, "json": [
+        {"path": "publish.the_mandate", "op": "not_contains", "value": "answered by a human"},
+        {"path": "publish.the_mandate", "op": "contains", "value": "NEXT block"}
+      ]}
+    },
+    {
+      "name": "O5 — a declared probe records nothing and carries no msgid",
+      "request": {"method": "POST", "path": "/api/exchange/manifest",
+        "body": {"agent_name": "book-demo", "probe": true,
+          "manifest_text": "identity — principal: Acme, ops@acme.example\nwants — a valuation\noffers — nothing\ninterface — I poll every 6 hours\ndelivery_contract — data\nboundary — nothing"}},
+      "expect": {"status": 200, "json": [
+        {"path": "probe", "op": "eq", "value": true},
+        {"path": "recorded", "op": "eq", "value": false},
+        {"path": "msgid", "op": "absent"},
+        {"path": "writes", "op": "eq", "value": "skipped"}
+      ]}
+    },
+    {
+      "name": "a real manifest is recorded and mints a 128-bit msgid",
+      "request": {"method": "POST", "path": "/api/exchange/manifest",
+        "body": {"agent_name": "book-demo",
+          "manifest_text": "identity — principal: Acme SAS, legal@acme.example; agent: book-demo, delegate\nwants — a project manager for 3 months\noffers — nothing\ninterface — I poll https://agent.example.com/exchange every 6 hours\ndelivery_contract — data only\nboundary — refuse legal advice",
+          "manifest": {"mandate": {"intents": [
+            {"direction": "buy", "service_type": "consultant_search",
+             "scope": {"capability": "project manager"}}]}}}},
+      "capture": {"msgid": "msgid"},
+      "expect": {"status": 200, "json": [
+        {"path": "verdict", "op": "eq", "value": "PASS"},
+        {"path": "msgid", "op": "matches", "value": "^manifest-[0-9]+-[0-9a-f]{32}$"},
+        {"path": "next", "op": "exists"}
+      ]}
+    },
+    {
+      "name": "O4 — the served disclosure uses the participant vocabulary (not a tier word)",
+      "request": {"method": "GET", "path": "/api/exchange/answer/${msgid}"},
+      "expect": {"status": 200, "json": [
+        {"path": "found", "op": "eq", "value": true},
+        {"path": "disclosure.next_step", "op": "in", "value": ["none", "narrow", "handshake"]},
+        {"path": "disclosure.next_step", "op": "ne", "value": "floor"}
+      ]}
+    },
+    {
+      "name": "the first poll returns the thread and an honest note",
+      "request": {"method": "GET", "path": "/api/exchange/answer/${msgid}"},
+      "expect": {"status": 200, "json": [
+        {"path": "total_messages", "op": "ge", "value": 1},
+        {"path": "note", "op": "contains", "value": "Answers come from our internal agent"}
+      ]}
+    },
+    {
+      "name": "O2 — a delta poll with no new messages says so, not 'No answer yet'",
+      "request": {"method": "GET", "path": "/api/exchange/answer/${msgid}?since=999999999"},
+      "expect": {"status": 200, "json": [
+        {"path": "count", "op": "eq", "value": 0},
+        {"path": "note", "op": "contains", "value": "No new messages"},
+        {"path": "note", "op": "not_contains", "value": "No answer yet"}
+      ]}
+    },
+    {
+      "name": "O3 — a modern msgid is never declared weak (no second key)",
+      "request": {"method": "GET", "path": "/api/exchange/answer/${msgid}"},
+      "expect": {"status": 200, "json": [
+        {"path": "use_this_instead", "op": "absent"},
+        {"path": "answer_key", "op": "absent"}
+      ]}
+    },
+    {
+      "name": "a mandate-less declaration is asked to name a service (never routed to a human)",
+      "request": {"method": "POST", "path": "/api/exchange/manifest",
+        "body": {"agent_name": "book-demo-nomandate",
+          "manifest_text": "identity — Acme, ops@acme.example\nwants — I want to sell my software company\noffers — nothing\ninterface — I poll every 6 hours\ndelivery_contract — data\nboundary — nothing"}},
+      "expect": {"status": 200, "json": [
+        {"path": "next.you", "op": "matches", "value": "(name the service|declare a structured)"},
+        {"path": "next", "op": "not_contains", "value": "human"}
+      ]}
+    },
+    {
+      "name": "the reply leg accepts the key you already hold",
+      "request": {"method": "POST", "path": "/api/exchange/reply",
+        "body": {"key": "${msgid}", "text": "following up on my request"}},
+      "expect": {"status": 200, "json": [{"path": "ok", "op": "eq", "value": true}]}
+    },
+    {
+      "name": "an unknown key is a clean 404, not a 500",
+      "request": {"method": "GET", "path": "/api/exchange/answer/manifest-0-00000000000000000000000000000000"},
+      "expect": {"status": 404, "json": [{"path": "found", "op": "eq", "value": false}]}
+    }
+  ]
+}
