@@ -98,6 +98,29 @@ a `POST /api/exchange/manifest` there records a real declaration and a `POST /ap
 writes to a real thread. Prefer `"probe": true` bodies when you only want to validate. The sample
 book is designed to run against the test server; adapt or trim it before pointing it at live.
 
+## Testing your agent (the process book)
+
+Beyond the REST contract, this repo carries an executable acceptance suite for an agent that posts
+a request and follows the thread. The full book is `docs/test-book.md` (45 tests, each traced to a
+defect in two real sessions).
+
+```bash
+python3 testbook.py --serve tests/contract_book.json                       # the mock is faithful (71 cases)
+python3 agent_conformance.py --agent "python3 agents/reference_agent.py"   # run YOUR agent here instead
+python3 static_checks.py path/to/agent-repo                                # read the agent's source
+make selftest                                                              # the tests pass a good agent and fail a bad one
+```
+
+- `server.py` also serves test controls under `/_test/*` (reset, quirk config, request log, a
+  stand-in for the human principal) and the workspace join, `/api/nda/sign` and session reads. The
+  quirks replay live defects: `answer_undecided`, `weak_msgid`, `null_answer_key`,
+  `since_no_answer_yet`, `probe_returns_msgid`, `hold_acceptance`, `auto_confirm_gate`, and others
+  (see the header of `server.py`). With no quirks the server behaves as before.
+- `agent_conformance.py` runs your command once per scenario with the environment documented in
+  `agents/reference_agent.py`, then asserts on the server's request log and the agent's stdout.
+  Exit 1 means a BLOCKER failed.
+- `agents/naive_agent.py` is a deliberately bad client (the negative control). Do not copy it.
+
 ## Notes and limits
 
 - **In-memory.** State lives for the life of the process; restarting clears it. That is deliberate

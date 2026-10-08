@@ -31,6 +31,7 @@ Endpoints
 Run `python3 server.py --help` for options.
 """
 import argparse
+import copy
 import itertools
 import json
 import re
@@ -180,6 +181,32 @@ SPEC = {
 _LOCK = threading.Lock()
 _RECORDS = {}            # msgid -> record
 _IDS = itertools.count(1)   # message id sequence
+_BYKEY = {}              # answer_key -> record (only minted under the weak_msgid quirk)
+_SESSIONS = {}           # workspace uuid -> record
+_REQLOG = []             # every non-/_test request, for assertions on what a CLIENT did
+_LOG_LOCK = threading.Lock()
+_SECRETS = {'answer_keys': [], 'msgids': [], 'probe_msgids': []}
+
+# ── scenario controls (POST /_test/config) ───────────────────────────────────────────────────
+# Quirks replay behaviours seen on the LIVE exchange in two real external sessions, so a client can
+# be tested against them. With no quirks set, the server behaves exactly as before.
+#   strict_scope           validate mandate scope against the catalog's required keys (capability)
+#   spec_sector            the served SPEC says consultant_search needs `sector` (the probe says capability)
+#   answer_undecided       publish receipt shows SERVED but the thread reads scope UNDECIDED
+#   weak_msgid             the thread says "use answer_key"; a key is minted
+#   null_answer_key        ...but the publish receipt carries answer_key: null
+#   since_no_answer_yet    a delta poll with no new message says "No answer yet"
+#   probe_returns_msgid    a probe receipt carries a msgid that 404s
+#   hold_acceptance        no acceptance notice; handshake stays pending; join -> 409
+#   auto_confirm_gate      a second /api/nda/sign by the agent confirms the gate (no human, no supervisor)
+#   gate_pending_after_join / gate_confirmed_no_supervisor / human_approved_after_join
+#                          the gate state a join leaves behind
+# on_publish_messages: list of {kind, body, created?, link?, category?} appended to each new thread.
+_CFG = {'quirks': [], 'on_publish_messages': []}
+
+
+def _q(name):
+    return name in _CFG.get('quirks', [])
 
 
 def _now():
@@ -298,6 +325,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── helpers ──
     def _json(self, status, obj):
+        ri = getattr(self, '_ri', None)
+        if ri is not None and not ri['path'].startswith('/_test'):
+            with _LOG_LOCK:
+                _REQLOG.append(dict(ri, n=len(_REQLOG) + 1, status=status))
         body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
@@ -327,9 +358,22 @@ class Handler(BaseHTTPRequestHandler):
     # ── GET ──
     def do_GET(self):
         u = urlparse(self.path)
+        self._ri = {'method': 'GET', 'path': u.path, 'body': None, 'probe': False,
+                    'query': {k: v[0] for k, v in parse_qs(u.query).items()}}
+        if u.path.startswith('/_test/'):
+            return self._test_get(u.path)
+        m = re.match(r'^/api/(matches|deal-flow|matched-names|pairings|search)/([^/]+)$', u.path)
+        if m:
+            return self._session_read(m.group(1), m.group(2), self._ri['query'])
         if u.path == '/healthz':
             return self._json(200, {'ok': True, 'service': 'cape-agent-exchange-test'})
         if u.path == '/api/exchange/spec':
+            if _q('spec_sector'):
+                spec = copy.deepcopy(SPEC)
+                for svc in spec['catalog']['services']:
+                    if svc['service_type'] == 'consultant_search':
+                        svc['required'] = ['sector']
+                return self._json(200, spec)
             return self._json(200, SPEC)
         if u.path.startswith('/api/exchange/answer/'):
             msgid = u.path[len('/api/exchange/answer/'):]
@@ -345,6 +389,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         data, raw = self._body()
+        self._ri = {'method': 'POST', 'path': u.path, 'body': data, 'query': {},
+                    'probe': self._probe_requested(data)[0]}
+        if u.path.startswith('/_test/'):
+            return self._test_post(u.path, data)
+        if u.path == '/api/workspace/join':
+            return self._join(data)
+        if u.path == '/api/nda/sign':
+            return self._nda_sign(data)
         if u.path == '/api/exchange/manifest':
             return self._manifest(data, raw)
         if u.path == '/api/exchange/reply':
@@ -377,6 +429,15 @@ class Handler(BaseHTTPRequestHandler):
         probe, probe_reason = self._probe_requested(data)
 
         rows, fails = _inline_checks(manifest, text or '')
+        if _q('strict_scope') and isinstance(manifest, dict):
+            for it in _mandate_intents(manifest):
+                st = (it or {}).get('service_type')
+                have = (it or {}).get('scope') or {}
+                miss = [k for k in _REQUIRED.get(st, []) if not have.get(k)]
+                if miss:
+                    rows.append({'check': f'scope.{st}', 'result': 'FAIL',
+                                 'detail': 'required scope missing: ' + ', '.join(miss)})
+                    fails.append(f'scope.{st}: missing {miss}')
         verdict = 'FAIL' if fails else 'PASS'
         scope, disclosure, nxt = _scope_and_disclosure(manifest, text or '')
         declined = scope.get('bucket') == 'OUT_OF_SCOPE'
@@ -394,6 +455,7 @@ class Handler(BaseHTTPRequestHandler):
             'note': ('Your boundary has been recorded as a constraint. Nothing you sent was '
                      'executed and no authority was granted.'),
             'next': nxt,
+            'required_by_service': _REQUIRED,
             'your_principal': SPEC['your_principal'],
             'spec_url': SPEC['spec_url'],
         }
@@ -408,23 +470,51 @@ class Handler(BaseHTTPRequestHandler):
                 'keep_this': ('Nothing to keep: a declared probe records NOTHING, so no msgid '
                               'exists. Re-send without the probe field to have it recorded.'),
             })
+            if _q('probe_returns_msgid'):
+                fake = _mint_msgid()
+                _SECRETS['probe_msgids'].append(fake)
+                receipt['msgid'] = fake
             return self._json(200 if verdict == 'PASS' else 422, receipt)
 
         msgid = _mint_msgid()
         thread = str(data.get('thread') or '').strip() or msgid
         with _LOCK:
+            hold = _q('hold_acceptance')
             rec = {'id': next(_IDS), 'msgid': msgid, 'thread': thread, 'agent_name': agent_name,
                    'verdict': verdict, 'scope': scope, 'disclosure': disclosure,
-                   'status': 'PENDING', 'received_at': _now(), 'messages': []}
+                   'status': 'PENDING', 'received_at': _now(), 'messages': [],
+                   'accepted': not hold, 'uuid': None, 'tos': 'none', 'supervisor': None,
+                   'sign_requests': 0, 'answer_key': None,
+                   'text': (text or '') + ' ' + json.dumps(manifest or {}, ensure_ascii=False)}
+            if _q('answer_undecided'):
+                rec['scope'] = {'bucket': 'UNDECIDED', 'declined': False,
+                                'reason': ('no service_type and no deal object read from the '
+                                           'declaration')}
+                rec['disclosure'] = None
             _RECORDS[msgid] = rec
-            rec['messages'].append({
-                'id': next(_IDS), 'msgid': msgid, 'thread': thread, 'kind': 'notice',
-                'body': ('Your manifest is accepted. ' +
-                         (nxt.get('you') or 'See the NEXT block.')),
-                'created': _now()})
+            _SECRETS['msgids'].append(msgid)
+            if _q('weak_msgid'):
+                rec['answer_key'] = secrets.token_hex(16)
+                _BYKEY[rec['answer_key']] = rec
+                _SECRETS['answer_keys'].append(rec['answer_key'])
+            if not hold:
+                rec['messages'].append({
+                    'id': next(_IDS), 'msgid': msgid, 'thread': thread, 'kind': 'notice',
+                    'body': ('Your manifest is accepted. ' +
+                             (nxt.get('you') or 'See the NEXT block.')),
+                    'created': _now()})
+            for extra in _CFG.get('on_publish_messages') or []:
+                msg = {'id': next(_IDS), 'msgid': msgid, 'thread': thread,
+                       'kind': extra.get('kind', 'notice'), 'body': extra.get('body', ''),
+                       'created': extra.get('created') or _now()}
+                for k in ('link', 'category'):
+                    if k in extra:
+                        msg[k] = extra[k]
+                rec['messages'].append(msg)
         receipt.update({
             'id': rec['id'], 'msgid': msgid,
             'answer_url': f'/api/exchange/answer/{msgid}',
+            'answer_key': (None if _q('null_answer_key') else rec['answer_key']),
             'keep_this': ('Keep your msgid. It is the key back to this exchange — fetch '
                           '/api/exchange/answer/{msgid} to read your thread.'),
         })
@@ -432,7 +522,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _answer(self, msgid, since):
         with _LOCK:
-            rec = _RECORDS.get(msgid)
+            rec = _RECORDS.get(msgid) or _BYKEY.get(msgid)
             if rec is None:
                 return self._json(404, {
                     'found': False, 'error': 'no record for that key',
@@ -448,16 +538,22 @@ class Handler(BaseHTTPRequestHandler):
                 'answer_ready': len(msgs) > 0,
                 'count': len(msgs), 'total_messages': total, 'since': since, 'cursor': cursor,
                 'messages': msgs,
-                'state': {'access': {'tier': 1, 'uuid': None, 'handshake': 'accepted',
-                                     'tos': 'none'}},
+                'state': {'access': self._access(rec)},
                 'scope': rec['scope'],
                 # served disclosure uses the participant vocabulary; internal tier words stay in.
                 'disclosure': rec['disclosure'],
                 'note': _answer_note(len(msgs), total, since),
                 'spec_url': SPEC['spec_url'],
             }
-            # A modern 128-bit msgid IS the capability: no weak-key upgrade, no second key.
-            assert _STRONG_MSGID.match(msgid)
+            if _q('since_no_answer_yet') and not msgs and since > 0:
+                out['note'] = ('No answer yet. Nothing is pushed to you and you are never waited '
+                               'on - fetch this again whenever you choose.')
+            if _q('weak_msgid'):
+                out['use_this_instead'] = ('this msgid was issued with low entropy and is weak as a '
+                                           'key; use answer_key instead')
+            else:
+                # A modern 128-bit msgid IS the capability: no weak-key upgrade, no second key.
+                assert _STRONG_MSGID.match(rec['msgid'])
             return self._json(200, out)
 
     def _reply(self, data):
@@ -478,6 +574,138 @@ class Handler(BaseHTTPRequestHandler):
                                     'created': _now()})
             return self._json(200, {'ok': True, 'id': mid, 'thread': rec['thread'],
                                     'cursor': mid, 'spec_url': SPEC['spec_url']})
+
+    # ── workspace, gate, session reads (replayed from the live exchange; quirk-driven) ──
+    def _access(self, rec):
+        return {'tier': 2 if rec['uuid'] else 1, 'uuid': rec['uuid'],
+                'handshake': 'accepted' if rec['accepted'] else 'pending',
+                'tos': rec['tos'], 'gate_state': rec['tos'],
+                'gate_document': 'Terms of Engagement', 'supervisor': rec['supervisor']}
+
+    def _join(self, data):
+        if not isinstance(data, dict):
+            return self._json(400, {'error': 'body must be a JSON object'})
+        key = str(data.get('exchange_key') or '').strip()
+        uuid = str(data.get('uuid') or '').strip()
+        with _LOCK:
+            rec = _RECORDS.get(key) or _BYKEY.get(key)
+            if rec is None:
+                return self._json(404, {'ok': False,
+                                        'error': 'no accepted manifest for that exchange_key'})
+            if not rec['accepted']:
+                return self._json(409, {'ok': False,
+                                        'error': 'manifest not accepted yet; join after acceptance'})
+            if not uuid:
+                return self._json(400, {'ok': False, 'error': 'uuid is required'})
+            if rec['uuid'] is None:
+                rec['uuid'] = uuid
+                _SESSIONS[uuid] = rec
+                rec['delegate_declared'] = 'delegate' in rec['text'].lower()
+                if _q('gate_pending_after_join'):
+                    rec['tos'] = 'pending'
+                elif _q('gate_confirmed_no_supervisor'):
+                    rec['tos'] = 'confirmed'
+                elif _q('human_approved_after_join'):
+                    rec['tos'], rec['supervisor'] = 'confirmed', 'principal@example.test'
+            dele = bool(rec.get('delegate_declared'))
+            return self._json(200, {
+                'uuid': rec['uuid'], 'session_id': rec['uuid'],
+                'name': 'agent:' + rec['agent_name'],
+                'identity_recorded': 'agent-declared and UNVERIFIED',
+                'delegated': dele, 'delegate_of': ('declared delegate' if dele else None),
+                'inherited_uuid': dele,
+                'principal': ('not bound: the principal is recorded as the workspace supervisor '
+                              'only when a human binds it at the Terms of Service step')})
+
+    def _nda_sign(self, data):
+        sid = str(data.get('session_id') or '') if isinstance(data, dict) else ''
+        with _LOCK:
+            rec = _SESSIONS.get(sid)
+            if rec is None:
+                return self._json(404, {'ok': False, 'error': 'unknown session'})
+            if rec['tos'] == 'confirmed':
+                return self._json(200, {'ok': True, 'nda_signed': True, 'nda_status': 'confirmed'})
+            if _q('auto_confirm_gate') and rec['sign_requests'] >= 1:
+                rec['tos'] = 'confirmed'      # no supervisor, no email: the live defect
+                return self._json(200, {'ok': True, 'nda_signed': True, 'nda_status': 'confirmed'})
+            rec['sign_requests'] += 1
+            rec['tos'] = 'pending'
+            return self._json(202, {'ok': True, 'nda_signed': False, 'nda_status': 'pending',
+                                    'pending_human_approval': True,
+                                    'message': ('Your NDA request is awaiting review by your '
+                                                'supervisor. Names and financials stay locked '
+                                                'until they confirm.')})
+
+    def _session_read(self, kind, sid, query):
+        with _LOCK:
+            rec = _SESSIONS.get(sid)
+        if rec is None:
+            return self._json(404, {'error': 'unknown session'})
+        if kind in ('matches', 'deal-flow'):
+            if not (query.get('sector') or '').strip():
+                return self._json(404, {'error': 'Services-bench list not available; needs sector',
+                                        'example': 'Financial Services'})
+            return self._json(200, {'matches': [], 'count': 0})
+        if kind == 'matched-names':
+            return self._json(200, {'names': []})
+        if kind == 'pairings':
+            return self._json(200, {'pairings': []})
+        return self._json(200, {'sellers': [], 'buyers': []})
+
+    # ── test controls: reset, scenario config, request log, a stand-in for the human principal ──
+    def _test_get(self, path):
+        if path == '/_test/requests':
+            with _LOG_LOCK:
+                return self._json(200, {'requests': list(_REQLOG)})
+        if path == '/_test/secrets':
+            return self._json(200, _SECRETS)
+        if path == '/_test/stats':
+            with _LOG_LOCK:
+                log = list(_REQLOG)
+
+            def n(method, rx, probe=None):
+                return sum(1 for r in log if r['method'] == method and re.search(rx, r['path'])
+                           and (probe is None or r['probe'] == probe))
+            return self._json(200, {
+                'records': len(_RECORDS), 'requests': len(log),
+                'manifest_live': n('POST', r'^/api/exchange/manifest$', False),
+                'manifest_probe': n('POST', r'^/api/exchange/manifest$', True),
+                'answer_polls': n('GET', r'^/api/exchange/answer/'),
+                'join': n('POST', r'^/api/workspace/join$'),
+                'sign': n('POST', r'^/api/nda/sign$'),
+                'reply': n('POST', r'^/api/exchange/reply$'),
+                'matches': n('GET', r'^/api/(matches|deal-flow|search|pairings|matched-names)/')})
+        return self._json(404, {'error': 'no such test path'})
+
+    def _test_post(self, path, data):
+        data = data if isinstance(data, dict) else {}
+        if path == '/_test/reset':
+            with _LOCK:
+                _RECORDS.clear()
+                _BYKEY.clear()
+                _SESSIONS.clear()
+                for k in _SECRETS:
+                    _SECRETS[k] = []
+                _CFG.clear()
+                _CFG.update({'quirks': [], 'on_publish_messages': []})
+            with _LOG_LOCK:
+                _REQLOG.clear()
+            return self._json(200, {'ok': True})
+        if path == '/_test/config':
+            for k in ('quirks', 'on_publish_messages'):
+                if k in data:
+                    _CFG[k] = data[k]
+            return self._json(200, {'ok': True, 'config': _CFG})
+        if path == '/_test/human/approve':
+            with _LOCK:
+                rec = _SESSIONS.get(str(data.get('session_id') or ''))
+                if rec is None:
+                    return self._json(404, {'ok': False, 'error': 'unknown session'})
+                rec['tos'] = 'confirmed'
+                rec['supervisor'] = data.get('supervisor') or 'principal@example.test'
+            return self._json(200, {'ok': True, 'tos': 'confirmed',
+                                    'supervisor': rec['supervisor']})
+        return self._json(404, {'error': 'no such test path'})
 
 
 def main():

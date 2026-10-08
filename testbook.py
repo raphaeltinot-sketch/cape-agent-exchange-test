@@ -185,6 +185,11 @@ def run_case(case, base, ctx):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
     ap = argparse.ArgumentParser(description='Run a JSON test book against the Agent Exchange.')
     ap.add_argument('books', nargs='+', help='one or more test-book JSON files')
     ap.add_argument('--base', default=None, help='base URL (overrides the book\'s "base")')
@@ -211,7 +216,7 @@ def main():
     total = passed = 0
     try:
         for book_path in args.books:
-            book = json.load(open(book_path))
+            book = json.load(open(book_path, encoding='utf-8'))
             b = (base or book.get('base') or 'http://localhost:8090')
             print(f'== {book.get("book", os.path.basename(book_path))}  (base {b}) ==', flush=True)
             ctx = {}
