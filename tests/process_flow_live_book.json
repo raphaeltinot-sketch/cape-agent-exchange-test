@@ -1,0 +1,59 @@
+{
+  "book": "Process-flow fixes (O1-O5) verified against the LIVE exchange — read/probe only",
+  "base": "https://www.capepartners.fr",
+  "cases": [
+    {
+      "name": "O1 - the served spec no longer says a human classifies a mandate-less declaration",
+      "request": {"method": "GET", "path": "/api/exchange/spec"},
+      "expect": {"status": 200, "json": [
+        {"path": "publish.the_mandate", "op": "not_contains", "value": "answered by a human"},
+        {"path": "publish.the_mandate", "op": "contains", "value": "NEXT block"}
+      ]}
+    },
+    {
+      "name": "O5 - a declared probe records nothing and carries no msgid (writes nothing)",
+      "request": {"method": "POST", "path": "/api/exchange/manifest",
+        "body": {"agent_name": "process-flow-live-check", "probe": true,
+          "manifest_text": "identity — principal: Acme, ops@acme.example\nwants — a valuation\noffers — nothing\ninterface — I poll every 6 hours\ndelivery_contract — data only\nboundary — refuse legal advice"}},
+      "expect": {"status": [200, 422], "json": [
+        {"path": "probe", "op": "eq", "value": true},
+        {"path": "recorded", "op": "eq", "value": false},
+        {"path": "msgid", "op": "absent"}
+      ]}
+    },
+    {
+      "name": "O2 - a delta poll on the Stellantis thread reads 'No new messages', not 'No answer yet'",
+      "request": {"method": "GET", "path": "/api/exchange/answer/manifest-1791447009-34f6777bf01671a2a90b8ee5a266927b?since=999999999"},
+      "expect": {"status": 200, "json": [
+        {"path": "total_messages", "op": "ge", "value": 1},
+        {"path": "note", "op": "contains", "value": "No new messages"},
+        {"path": "note", "op": "not_contains", "value": "No answer yet"}
+      ]}
+    },
+    {
+      "name": "O2b - same on the Moudie thread",
+      "request": {"method": "GET", "path": "/api/exchange/answer/manifest-1791445047-f56a57e8724f1d4f527d6a7ab97621b3?since=999999999"},
+      "expect": {"status": 200, "json": [
+        {"path": "total_messages", "op": "ge", "value": 1},
+        {"path": "note", "op": "contains", "value": "No new messages"},
+        {"path": "note", "op": "not_contains", "value": "No answer yet"}
+      ]}
+    },
+    {
+      "name": "O3 - a modern 128-bit msgid is never declared weak (no second key)",
+      "request": {"method": "GET", "path": "/api/exchange/answer/manifest-1791447009-34f6777bf01671a2a90b8ee5a266927b"},
+      "expect": {"status": 200, "json": [
+        {"path": "use_this_instead", "op": "absent"},
+        {"path": "answer_key", "op": "absent"}
+      ]}
+    },
+    {
+      "name": "O4 - the served disclosure uses the participant vocabulary (never a tier word)",
+      "request": {"method": "GET", "path": "/api/exchange/answer/manifest-1791447009-34f6777bf01671a2a90b8ee5a266927b"},
+      "expect": {"status": 200, "json": [
+        {"path": "disclosure.next_step", "op": "in", "value": ["none", "narrow", "handshake"]},
+        {"path": "disclosure.next_step", "op": "ne", "value": "floor"}
+      ]}
+    }
+  ]
+}
